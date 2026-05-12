@@ -71,6 +71,16 @@ class MokioMindConfig(PretrainedConfig):
             else None
         )
 
+import torch
+import math
+import torch.nn as nn
+from torch.nn import init
+from typing import Optional, Tuple, List, Union
+import torch.nn.functional as F
+from transformers.activations import ACT2FN
+from transformers import PreTrainedModel, GenerationMixin, PretrainedConfig
+from transformers.modeling_outputs import CausalLMOutputWithPast
+
 
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-5):
