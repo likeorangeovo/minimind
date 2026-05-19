@@ -8,3 +8,16 @@ wheels/
 
 # Virtual environments
 .venv
+
+# IDE
+.idea/
+
+# Datasets and caches
+dataset/.cache/
+dataset/pretrain_hq.jsonl
+dataset/sft_t2t_mini.jsonl
+
+# Training artifacts
+out/
+checkpoints/
+*.pth

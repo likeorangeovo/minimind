@@ -3,7 +3,9 @@ import sys
 
 
 __package__ = "trainer"
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+SCRIPT_DIR = os.path.abspath(os.path.dirname(__file__))
+PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
+sys.path.append(PROJECT_ROOT)
 
 import argparse  # 命令行参数解析
 import time  # 时间统计
@@ -36,14 +38,17 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
     start_time = time.time()  # 记录开始时间
 
     # 遍历数据批次
-    for step, (input_ids, labels, attention_mask) in enumerate(
-        loader, start=start_step + 1
-    ):
-        input_ids = input_ids.to(args.device)
-        labels = labels.to(args.device)
-        attention_mask = attention_mask.to(
-            args.device
-        )  # ！修正：接收并转移 attention_mask
+    for step, batch in enumerate(loader, start=start_step + 1):
+        if isinstance(batch, (list, tuple)):
+            input_ids = batch[0]
+        else:
+            input_ids = batch
+        input_ids = input_ids.to(args.device, non_blocking=True)
+        labels = input_ids.clone()
+        labels[input_ids == pad_token_id] = -100
+        # 预训练阶段 pad 只在右侧、labels 已置 -100 忽略 pad 损失，
+        # 所以 attention_mask 不再下传给模型，让 SDPA 走 is_causal 快速路径。
+        # labels 鐩存帴鍦?GPU 涓婃瀯閫狅紝閬垮厤棰濆鐨?CPU labels/attention_mask 鐢熸垚鍜屼紶杈?
 
         lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
 
@@ -51,30 +56,25 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             param_group["lr"] = lr
 
         with autocast_ctx:
-            # 前向传播
-            res = model(
-                input_ids, labels=labels, attention_mask=attention_mask
-            )  # ！修正：直接传入labels和attention_mask，由模型内部计算loss
+            res = model(input_ids, labels=labels)
+            loss = (res.loss + res.aux_loss) / args.accumulation_steps
 
-            loss = (
-                res.loss + res.aux_loss
-            )  # ！修正：原手动计算loss_fct+loss_mask，现用模型内置的loss
-
-            loss = loss / args.accumulation_steps
-
-        scaler.scale(loss).backward()
+        if use_scaler:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
 
         if step % args.accumulation_steps == 0:
-            # scaler.unscale_(): 还原梯度的真实值
-            scaler.unscale_(optimizer)
+            if use_scaler:
+                scaler.unscale_(optimizer)
 
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
 
-            # 📚 优化器更新知识点
-            # scaler.step(): 执行参数更新
-            # scaler.update(): 更新scaler的缩放因子
-            scaler.step(optimizer)
-            scaler.update()
+            if use_scaler:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
 
             optimizer.zero_grad(set_to_none=True)
 
@@ -103,6 +103,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
                 "_moe" if hasattr(lm_config, "use_moe") and lm_config.use_moe else ""
             )
             ckp = f"{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth"
+            os.makedirs(args.save_dir, exist_ok=True)
 
             # 📚 分布式模型保存知识点
             # DDP模型需要通过.module访问真正的模型
@@ -114,7 +115,19 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             # 📚 半精度保存知识点
             # 将float32参数转为float16，减少存储空间
             state_dict = {k: v.half() for k, v in state_dict.items()}
-            torch.save(state_dict, ckp)
+            ckp_tmp = ckp + ".tmp"
+            torch.save(state_dict, ckp_tmp)
+            try:
+                os.replace(ckp_tmp, ckp)
+            except PermissionError:
+                fallback_ckp = (
+                    f"{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}"
+                    f"{moe_suffix}_step{step}.pth"
+                )
+                os.replace(ckp_tmp, fallback_ckp)
+                Logger(
+                    f"Checkpoint target is busy, saved to fallback path: {fallback_ckp}"
+                )
 
             # 保存完整训练状态
             lm_checkpoint(
@@ -145,7 +158,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--epochs", type=int, default=1, help="训练轮数（建议1轮zero或2-6轮充分训练）"
     )
-    parser.add_argument("--batch_size", type=int, default=32, help="batch size")
+    parser.add_argument("--batch_size", type=int, default=4, help="batch size")
     parser.add_argument("--learning_rate", type=float, default=5e-4, help="初始学习率")
 
     # ========== 硬件和性能参数 ==========
@@ -156,15 +169,34 @@ if __name__ == "__main__":
         help="训练设备",
     )
     parser.add_argument("--dtype", type=str, default="bfloat16", help="混合精度类型")
-    parser.add_argument("--num_workers", type=int, default=1, help="数据加载线程数")
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=0,
+        help="数据加载线程数",
+    )
+    parser.add_argument(
+        "--compile",
+        type=int,
+        default=0,
+        choices=[0, 1],
+        help="是否用 torch.compile 编译模型（0=否，1=是）",
+    )
 
     # ========== 训练策略参数 ==========
     parser.add_argument(
-        "--accumulation_steps", type=int, default=8, help="梯度累积步数"
+        "--accumulation_steps", type=int, default=64, help="梯度累积步数"
     )
     parser.add_argument("--grad_clip", type=float, default=1.0, help="梯度裁剪阈值")
     parser.add_argument("--log_interval", type=int, default=100, help="日志打印间隔")
     parser.add_argument("--save_interval", type=int, default=100, help="模型保存间隔")
+    parser.add_argument(
+        "--gradient_checkpointing",
+        type=int,
+        default=1,
+        choices=[0, 1],
+        help="是否启用梯度检查点，0=关闭，1=开启",
+    )
 
     # ========== 模型架构参数 ==========
     parser.add_argument("--hidden_size", default=512, type=int, help="隐藏层维度")
@@ -209,6 +241,11 @@ if __name__ == "__main__":
 
     # 解析命令行参数
     args = parser.parse_args()
+    if not os.path.isabs(args.data_path):
+        args.data_path = os.path.abspath(os.path.join(SCRIPT_DIR, args.data_path))
+    if not os.path.isabs(args.save_dir):
+        args.save_dir = os.path.abspath(os.path.join(SCRIPT_DIR, args.save_dir))
+    checkpoint_dir = os.path.abspath(os.path.join(SCRIPT_DIR, "../checkpoints"))
 
     # ========== 1. 初始化环境和随机种子 ==========
     """
@@ -246,7 +283,7 @@ if __name__ == "__main__":
     # 如果开启了断点续训，尝试加载之前的训练状态
     ckp_data = (
         lm_checkpoint(
-            lm_config, weight=args.save_weight, save_dir="../checkpoints"
+            lm_config, weight=args.save_weight, save_dir=checkpoint_dir
         )  # ！修正：原"checkpoints"缺少../前缀
         if args.from_resume == 1
         else None
@@ -262,11 +299,23 @@ if __name__ == "__main__":
     device_type = "cuda" if "cuda" in args.device else "cpu"
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
 
-    # 📚 上下文管理器知识点
-    # CPU不支持autocast，使用nullcontext作为空操作
+    # 在 Ampere+ 上放开 TF32，matmul 吞吐显著提升，对 LM 收敛几乎无影响
+    if device_type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
+
+    # 用新版 torch.amp API；CPU 分支退化为 nullcontext
     autocast_ctx = (
-        nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast(dtype=dtype)
+        nullcontext()
+        if device_type == "cpu"
+        else torch.amp.autocast(device_type="cuda", dtype=dtype)
     )
+    # bf16 动态范围足够大，GradScaler 不再必要（且 autocast_bf16 本身也不支持 scaler）
+    use_scaler = device_type == "cuda" and args.dtype == "float16"
 
     # ========== 4. 配置WandB实验跟踪 ==========
     """
@@ -302,14 +351,21 @@ if __name__ == "__main__":
     """
     # 初始化模型和分词器
     model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
+    if hasattr(model, "model"):
+        model.model.gradient_checkpointing = bool(args.gradient_checkpointing)
+    pad_token_id = tokenizer.pad_token_id
 
     train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
 
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
 
-    scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == "float16"))
+    scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
 
-    optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
+    # fused AdamW 在新版 PyTorch 上比 foreach 还要快一档
+    try:
+        optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate, fused=True)
+    except TypeError:
+        optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
 
     start_epoch, start_step = 0, 0
     if ckp_data:
@@ -329,6 +385,22 @@ if __name__ == "__main__":
         model._ddp_params_and_buffers_to_ignore = {"freqs_cos", "freqs_sin"}
         model = DistributedDataParallel(model, device_ids=[local_rank])
 
+    # 可选 torch.compile：一次编译换稳态吞吐（首个 step 会比较慢）
+    if args.compile and device_type == "cuda":
+        model = torch.compile(model)
+
+    # 统一的 DataLoader 参数，避免重复
+    loader_kwargs = dict(
+        num_workers=args.num_workers,
+        pin_memory=(device_type == "cuda"),
+        persistent_workers=args.num_workers > 0,
+        prefetch_factor=4 if args.num_workers > 0 else None,
+        drop_last=True,
+    )
+    # prefetch_factor 在 num_workers=0 时不允许传
+    if args.num_workers == 0:
+        loader_kwargs.pop("prefetch_factor")
+
     for epoch in range(start_epoch, args.epochs):
         # 📚 分布式采样器epoch设置
         # 每个epoch设置不同的随机种子，确保数据顺序随机化
@@ -337,15 +409,13 @@ if __name__ == "__main__":
 
         # 📚 断点续训逻辑
         if epoch == start_epoch and start_step > 0:  # 第一个epoch且存在检查点
-            # 使用跳批采样器，跳过已训练的数据
             batch_sampler = SkipBatchSampler(
                 train_sampler or range(len(train_ds)), args.batch_size, start_step
             )
             loader = DataLoader(
                 train_ds,
                 batch_sampler=batch_sampler,
-                num_workers=args.num_workers,
-                pin_memory=True,
+                **{k: v for k, v in loader_kwargs.items() if k != "drop_last"},
             )
             Logger(
                 f"Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始"
@@ -357,7 +427,6 @@ if __name__ == "__main__":
                 batch_size=args.batch_size,
                 shuffle=(train_sampler is None),
                 sampler=train_sampler,
-                num_workers=args.num_workers,
-                pin_memory=True,
+                **loader_kwargs,
             )
             train_epoch(epoch, loader, len(loader), 0, wandb)

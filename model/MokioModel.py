@@ -75,6 +75,7 @@ import torch
 import math
 import torch.nn as nn
 from torch.nn import init
+from torch.utils.checkpoint import checkpoint
 from typing import Optional, Tuple, List, Union
 import torch.nn.functional as F
 from transformers.activations import ACT2FN
@@ -181,6 +182,18 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     )
     return q_embed, k_embed
 
+
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    if n_rep == 1:
+        return hidden_states
+
+    batch, seq_len, num_kv_heads, head_dim = hidden_states.shape
+    hidden_states = hidden_states[:, :, :, None, :].expand(
+        batch, seq_len, num_kv_heads, n_rep, head_dim
+    )
+    return hidden_states.reshape(batch, seq_len, num_kv_heads * n_rep, head_dim)
+
+
 class Attention(nn.Module):
     def __init__(self, args: MokioMindConfig):
         super().__init__()
@@ -248,12 +261,12 @@ class Attention(nn.Module):
             repeat_kv(xv, self.n_rep).transpose(1, 2),
         )
 
-        if (
-            self.flash
-            and (seq_len > 1)
-            and (past_key_value is None)
-            and (attention_mask is None or torch.all(attention_mask == 1))
-        ):
+        # Flash/SDPA 快速路径：
+        # - 训练预训练阶段 pad 只在右侧，且 labels 中 pad 位置已置 -100，
+        #   pad token 不产生梯度，因此无需在 attention 层显式屏蔽。
+        # - 原来的 torch.all(attention_mask==1) 会触发 GPU->CPU 同步，
+        #   且对含 pad 的 batch 永远为 False，导致永远走慢速手写分支。
+        if self.flash and (seq_len > 1) and (past_key_value is None):
             output = F.scaled_dot_product_attention(
                 xq,
                 xk,
@@ -305,6 +318,16 @@ class FeedForward(nn.Module):
         gated = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
         return self.dropout(self.down_proj(gated))
 
+
+class MoEFeedForward(FeedForward):
+    def __init__(self, config: MokioMindConfig):
+        super().__init__(config)
+        self.aux_loss = torch.tensor(0.0)
+
+    def forward(self, x):
+        self.aux_loss = x.new_zeros(())
+        return super().forward(x)
+
 class MokioMindBlock(nn.Module):
     def __init__(self, layer_id: int, config: MokioMindConfig):
         super().__init__()
@@ -353,6 +376,7 @@ class MokioMindModel(nn.Module):
     def __init__(self, config: MokioMindConfig):
         super().__init__()
         self.config = config
+        self.gradient_checkpointing = False
         self.vocab_size, self.num_hidden_layers = (
             config.vocab_size,
             config.num_hidden_layers,
@@ -407,13 +431,29 @@ class MokioMindModel(nn.Module):
         for layer_idx, (layer, past_key_value) in enumerate(
             zip(self.layers, past_key_values)
         ):
-            hidden_states, present = layer(
-                hidden_states,
-                position_embeddings,
-                past_key_value=past_key_value,
-                use_cache=use_cache,
-                attention_mask=attention_mask,
-            )
+            if self.gradient_checkpointing and self.training and not use_cache:
+                def custom_forward(hidden_states):
+                    layer_out, _ = layer(
+                        hidden_states,
+                        position_embeddings,
+                        past_key_value=None,
+                        use_cache=False,
+                        attention_mask=attention_mask,
+                    )
+                    return layer_out
+
+                hidden_states = checkpoint(
+                    custom_forward, hidden_states, use_reentrant=False
+                )
+                present = None
+            else:
+                hidden_states, present = layer(
+                    hidden_states,
+                    position_embeddings,
+                    past_key_value=past_key_value,
+                    use_cache=use_cache,
+                    attention_mask=attention_mask,
+                )
             presents.append(present)
 
         hidden_states = self.norm(hidden_states)

@@ -43,8 +43,10 @@ def setup_seed(seed: int):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    # 训练吞吐优先：cudnn.benchmark 让卷积/SDPA 自动挑最快算法；
+    # deterministic=False 允许使用更快但不严格可复现的内核。
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
 
 
 # 设置检查点
@@ -143,8 +145,20 @@ def init_model(
         tokenizer_path = os.path.join(project_root, "model")
 
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+    special_tokens = {}
+    if tokenizer.bos_token is None:
+        special_tokens["bos_token"] = "<s>"
+    if tokenizer.eos_token is None:
+        special_tokens["eos_token"] = "</s>"
+    if tokenizer.pad_token is None:
+        special_tokens["pad_token"] = "<pad>"
 
+    if special_tokens:
+        tokenizer.add_special_tokens(special_tokens)
+
+    lm_config.vocab_size = len(tokenizer)
     model = MokioMindForCausalLM(lm_config)
+    model.resize_token_embeddings(len(tokenizer))
 
     if from_weight != "none":
         moe_suffix = (
@@ -155,6 +169,13 @@ def init_model(
         )
 
         weights = torch.load(weight_path, map_location=device)
+
+        embed_key = "model.embed_tokens.weight"
+        if embed_key in weights:
+            checkpoint_vocab_size = weights[embed_key].shape[0]
+            if checkpoint_vocab_size != lm_config.vocab_size:
+                lm_config.vocab_size = checkpoint_vocab_size
+                model.resize_token_embeddings(checkpoint_vocab_size)
 
         model.load_state_dict(weights, strict=False)
 
